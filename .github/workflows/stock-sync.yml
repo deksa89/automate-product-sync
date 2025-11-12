@@ -1,14 +1,18 @@
 name: Shopify Stock Sync
 
 on:
+  # Run on a schedule (CRON IS IN UTC!)
   schedule:
-    - cron: "*/30 * * * *"     # every 30 minutes (UTC)
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+  # Allow manual runs from the Actions tab
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    # Prevent overlapping runs (e.g., if a run takes longer than 30m)
     concurrency:
       group: shopify-stock-sync
       cancel-in-progress: false
@@ -27,84 +31,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Run the sync but don't fail the job yet; we'll parse results first
       - name: Run stock sync
-        id: run
-        continue-on-error: true
         env:
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           SUPPLIER_FEED: ${{ secrets.SUPPLIER_FEED }}
-        shell: bash
         run: |
-          python final_sync.py | tee run.log
-          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
-
-      # Parse how many products were updated and extract a short summary
-      - name: Parse result
-        id: parse
-        if: always()
-        shell: bash
-        run: |
-          # Try to locate a line like: "Done! Updated 37 matching products"
-          # Adjust the grep/regex if your script prints a different phrase.
-          count=$(grep -Eo 'Updated[[:space:]]+[0-9]+' run.log | awk '{print $2}' | tail -1)
-          summary=$(grep -E 'Done|Updated' run.log | tail -1 || true)
-
-          # Fallbacks
-          if [ -z "$count" ]; then count=0; fi
-          if [ -z "$summary" ]; then summary="No summary line found in output."; fi
-
-          # Capture up to 200 lines of tail for troubleshooting on failure emails
-          tail -n 200 run.log > tail.log
-
-          {
-            echo "updated_count=$count"
-            echo "summary<<EOF"
-            cat <<<"$summary"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      # ---- EMAIL: SUCCESS ----
-      - name: Send success email
-        if: ${{ steps.run.outputs.exit_code == '0' }}
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "✅ Shopify stock sync succeeded — updated ${{ steps.parse.outputs.updated_count }} products"
-          from: ${{ secrets.MAIL_FROM }}
-          to: ${{ secrets.MAIL_TO }}
-          content_type: text/html
-          html_body: |
-            <p>Shopify stock sync finished successfully.</p>
-            <ul>
-              <li><b>Updated products:</b> ${{ steps.parse.outputs.updated_count }}</li>
-              <li><b>Summary:</b> ${{ steps.parse.outputs.summary }}</li>
-              <li><b>Run:</b> <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View logs</a></li>
-            </ul>
-
-      # ---- EMAIL: FAILURE ----
-      - name: Send failure email
-        if: ${{ steps.run.outputs.exit_code != '0' }}
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "❌ Shopify stock sync FAILED"
-          from: ${{ secrets.MAIL_FROM }}
-          to: ${{ secrets.MAIL_TO }}
-          content_type: text/html
-          html_body: |
-            <p>Shopify stock sync <b>failed</b>.</p>
-            <ul>
-              <li><b>Updated products (parsed):</b> ${{ steps.parse.outputs.updated_count }}</li>
-              <li><b>Summary:</b> ${{ steps.parse.outputs.summary }}</li>
-              <li><b>Run:</b> <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View logs</a></li>
-            </ul>
-            <p>Last 200 lines of output:</p>
-            <pre>${{ steps.parse.outputs.summary }}</pre>
+          python final_sync.py
