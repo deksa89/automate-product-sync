@@ -1,0 +1,79 @@
+name: Shopify Stock Sync
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes (UTC)
+  workflow_dispatch: {}       # allows manual run from Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    concurrency:
+      group: shopify-stock-sync
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run stock sync
+        id: sync
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SUPPLIER_FEED: ${{ secrets.SUPPLIER_FEED }}
+        run: |
+          python final_sync.py > output.log 2>&1
+          cat output.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+          # Extract summary line (starts with ✅)
+          summary=$(grep -E "✅" output.log || echo "No summary found")
+          echo "summary=$summary" >> $GITHUB_OUTPUT
+
+      - name: Send Discord notification
+        if: always()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          STATUS="${{ job.status }}"
+          SUMMARY="${{ steps.sync.outputs.summary }}"
+          if [ "$STATUS" = "success" ]; then
+            COLOR=3066993
+            MESSAGE="✅ Shopify stock sync completed successfully!"
+          else
+            COLOR=15158332
+            MESSAGE="❌ Shopify stock sync failed. Check logs in GitHub Actions."
+          fi
+
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          PAYLOAD=$(jq -n \
+            --arg content "" \
+            --argjson embeds "[{
+              \"title\": \"Shopify Stock Sync\",
+              \"description\": \"$MESSAGE\\n\\n**$SUMMARY**\",
+              \"color\": $COLOR,
+              \"fields\": [
+                {\"name\": \"Status\", \"value\": \"$STATUS\", \"inline\": true},
+                {\"name\": \"Repository\", \"value\": \"${{ github.repository }}\", \"inline\": true},
+                {\"name\": \"Run\", \"value\": \"[View Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}
+              ],
+              \"footer\": {\"text\": \"$TIMESTAMP\"}
+            }]" \
+            '{content: $content, embeds: $embeds}' )
+
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "$PAYLOAD" \
+               "$DISCORD_WEBHOOK"
