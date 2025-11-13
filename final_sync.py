@@ -15,6 +15,30 @@ QTY_COLUMN = "available_stock"
 
 HEADERS = {"X-Shopify-Access-Token": TOKEN}
 
+def send_mail(subject: str, body: str):
+    """Send an email notice after sync completes"""
+    import smtplib
+    from email.mime.text import MIMEText
+
+    sender = os.getenv("MAIL_FROM")
+    password = os.getenv("SMTP_PASSWORD")
+    receiver = os.getenv("MAIL_TO")
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = receiver
+
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, receiver, msg.as_string())
+        print("📧 Email sent successfully!")
+    except Exception as e:
+        print(f"⚠️ Failed to send email: {e}")
 
 def get_all_shopify_variants():
     """Fetch all product variants (with SKU + inventory_item_id) from Shopify"""
@@ -103,6 +127,13 @@ def main():
 
     print(f"\n🏁 Done! Updated {updated_count} matching products.")
 
+    # Send email notification
+    subject = "Shopify Dreamlove's Stock Sync Completed"
+    body = (
+        f"Shopify–Dreamlove stock sync finished successfully.\n\n"
+        f"Updated products: {updated_count}"
+    )
+    send_mail(subject, body)
 
 if __name__ == "__main__":
     main()
