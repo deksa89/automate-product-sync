@@ -25,6 +25,7 @@ def send_mail(subject: str, body: str):
     receiver = os.getenv("MAIL_TO")
     smtp_server = os.getenv("SMTP_SERVER")
     smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USERNAME")
 
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -34,7 +35,7 @@ def send_mail(subject: str, body: str):
     try:
         with smtplib.SMTP(smtp_server, smtp_port) as server:
             server.starttls()
-            server.login(sender, password)
+            server.login(smtp_user, password)
             server.sendmail(sender, receiver, msg.as_string())
         print("📧 Email sent successfully!")
     except Exception as e:
