@@ -3,7 +3,7 @@ name: Shopify Stock Sync
 on:
   # Run on a schedule (CRON IS IN UTC!)
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+    - cron: "0 */2 * * *"   # every 2 hours (UTC)
   # Allow manual runs from the Actions tab
   workflow_dispatch:
 
