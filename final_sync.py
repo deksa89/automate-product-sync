@@ -30,7 +30,7 @@ HEADERS = {
 
 
 # ---------------------------------------------
-# BASIC ENV VALIDATION
+# ENV VALIDATION
 # ---------------------------------------------
 def validate_env():
     missing = []
@@ -91,7 +91,7 @@ def send_mail(subject: str, body: str):
 # ---------------------------------------------
 def clean_price(value):
     """
-    Converts supplier price to Shopify-compatible price string.
+    Converts price values to Shopify-compatible string.
 
     Examples:
     84.99 -> "84.99"
@@ -120,10 +120,8 @@ def clean_price(value):
         # Format: 84,99
         price = price.replace(",", ".")
 
-    # Remove anything that is not a digit or dot
     price = re.sub(r"[^0-9.]", "", price)
 
-    # If somehow there are multiple dots, price is invalid
     if price.count(".") > 1:
         return None
 
@@ -139,6 +137,18 @@ def clean_price(value):
         return None
 
     return str(decimal_price)
+
+
+def price_to_decimal(value):
+    cleaned = clean_price(value)
+
+    if cleaned is None:
+        return None
+
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation:
+        return None
 
 
 # ---------------------------------------------
@@ -164,11 +174,12 @@ def clean_quantity(value):
 # ---------------------------------------------
 def shopify_request(method, url, **kwargs):
     """
-    Small retry helper for Shopify API.
-    Useful if Shopify returns 429 rate limit.
+    Retry helper for Shopify API.
+    Handles basic 429 rate-limit responses.
     """
 
     max_retries = 5
+    response = None
 
     for attempt in range(max_retries):
         response = requests.request(method, url, headers=HEADERS, **kwargs)
@@ -196,7 +207,7 @@ def get_all_shopify_variants():
     while True:
         url = (
             f"https://{STORE}/admin/api/{API_VERSION}/variants.json"
-            f"?limit=250&fields=id,sku,inventory_item_id,price"
+            f"?limit=250&fields=id,sku,inventory_item_id,price,compare_at_price"
         )
 
         if page_info:
@@ -282,6 +293,34 @@ def set_variant_price(variant_id: int, price: str):
 
 
 # ---------------------------------------------
+# SALE CHECK
+# ---------------------------------------------
+def is_variant_on_sale(current_price, compare_at_price):
+    """
+    Returns True if Shopify variant is currently on sale.
+
+    Shopify sale logic:
+    price < compare_at_price
+
+    Example:
+    price = 72.24
+    compare_at_price = 84.99
+    Product is on sale, so script should not overwrite price.
+    """
+
+    current_price_decimal = price_to_decimal(current_price)
+    compare_at_price_decimal = price_to_decimal(compare_at_price)
+
+    if current_price_decimal is None:
+        return False
+
+    if compare_at_price_decimal is None:
+        return False
+
+    return current_price_decimal < compare_at_price_decimal
+
+
+# ---------------------------------------------
 # LOAD SUPPLIER CSV
 # ---------------------------------------------
 def load_csv_data(csv_url: str):
@@ -301,7 +340,10 @@ def load_csv_data(csv_url: str):
         PRICE_COLUMN,
     ]
 
-    missing_columns = [column for column in required_columns if column not in df.columns]
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
 
     if missing_columns:
         raise Exception(f"Missing required columns in CSV: {missing_columns}")
@@ -350,7 +392,8 @@ def main():
 
     updated_price_count = 0
     unchanged_price_count = 0
-    skipped_price_count = 0
+    skipped_sale_price_count = 0
+    skipped_invalid_price_count = 0
     failed_price_count = 0
 
     for _, row in matched_rows.iterrows():
@@ -367,10 +410,17 @@ def main():
 
         variant_id = variant["id"]
         inventory_item_id = variant["inventory_item_id"]
+
         current_shopify_price = clean_price(variant.get("price"))
+        current_compare_at_price = clean_price(variant.get("compare_at_price"))
+
+        product_is_on_sale = is_variant_on_sale(
+            current_shopify_price,
+            current_compare_at_price
+        )
 
         # ---------------------------------------------
-        # UPDATE STOCK
+        # UPDATE STOCK - always update stock
         # ---------------------------------------------
         stock_ok = set_inventory(location_id, inventory_item_id, qty)
 
@@ -380,35 +430,60 @@ def main():
             failed_stock_count += 1
 
         # ---------------------------------------------
-        # UPDATE PRICE
+        # UPDATE PRICE - but skip if product is on sale
         # ---------------------------------------------
         price_message = ""
 
-        if supplier_price is None:
-            skipped_price_count += 1
+        if product_is_on_sale:
+            skipped_sale_price_count += 1
+
+            price_message = (
+                f"price skipped - product is on sale "
+                f"{current_shopify_price} / compare-at {current_compare_at_price}"
+            )
+
+            print(
+                f"🏷️ {name} ({sku}) → "
+                f"qty={qty}, price skipped because product is on sale "
+                f"{current_shopify_price} / compare-at {current_compare_at_price}"
+            )
+
+        elif supplier_price is None:
+            skipped_invalid_price_count += 1
+
             price_message = "price skipped - invalid supplier price"
 
-            print(f"⚠️ {name} ({sku}) → qty={qty}, invalid price skipped")
+            print(
+                f"⚠️ {name} ({sku}) → "
+                f"qty={qty}, invalid supplier price skipped"
+            )
 
         elif current_shopify_price == supplier_price:
             unchanged_price_count += 1
+
             price_message = f"price unchanged {supplier_price}"
 
-            print(f"✅ {name} ({sku}) → qty={qty}, price unchanged={supplier_price}")
+            print(
+                f"✅ {name} ({sku}) → "
+                f"qty={qty}, price unchanged={supplier_price}"
+            )
 
         else:
             price_ok = set_variant_price(variant_id, supplier_price)
 
             if price_ok:
                 updated_price_count += 1
+
                 price_message = f"price {current_shopify_price} → {supplier_price}"
 
                 print(
                     f"✅ {name} ({sku}) → "
                     f"qty={qty}, price {current_shopify_price} → {supplier_price}"
                 )
+
             else:
                 failed_price_count += 1
+
                 price_message = f"price update failed, wanted {supplier_price}"
 
                 print(
@@ -429,7 +504,8 @@ def main():
     print(f"Failed stock updates: {failed_stock_count}")
     print(f"Updated prices: {updated_price_count}")
     print(f"Unchanged prices: {unchanged_price_count}")
-    print(f"Skipped prices: {skipped_price_count}")
+    print(f"Skipped sale prices: {skipped_sale_price_count}")
+    print(f"Skipped invalid prices: {skipped_invalid_price_count}")
     print(f"Failed price updates: {failed_price_count}")
 
     body = (
@@ -439,7 +515,8 @@ def main():
         f"Failed stock updates: {failed_stock_count}\n"
         f"Updated prices: {updated_price_count}\n"
         f"Unchanged prices: {unchanged_price_count}\n"
-        f"Skipped prices: {skipped_price_count}\n"
+        f"Skipped sale prices: {skipped_sale_price_count}\n"
+        f"Skipped invalid prices: {skipped_invalid_price_count}\n"
         f"Failed price updates: {failed_price_count}\n\n"
         + "\n".join(updated_items[:500])
     )
