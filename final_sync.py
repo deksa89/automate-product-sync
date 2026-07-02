@@ -22,6 +22,7 @@ SKU_COLUMN = "sku"
 QTY_COLUMN = "available_stock"
 NAME_COLUMN = "name"
 PRICE_COLUMN = "recommended_sale_price_with_taxes"
+DISCOUNT_MULTIPLIER = Decimal("0.90")  # 10% cheaper than recommended price
 
 HEADERS = {
     "X-Shopify-Access-Token": TOKEN,
@@ -149,6 +150,30 @@ def price_to_decimal(value):
         return Decimal(cleaned)
     except InvalidOperation:
         return None
+
+def calculate_discounted_price(value):
+    """
+    Calculates Shopify price as 10% cheaper than supplier recommended price.
+
+    Example:
+    recommended_sale_price_with_taxes = 84.99
+    Shopify price = 76.49
+    """
+
+    original_price = price_to_decimal(value)
+
+    if original_price is None:
+        return None
+
+    discounted_price = (original_price * DISCOUNT_MULTIPLIER).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP
+    )
+
+    if discounted_price <= 0:
+        return None
+
+    return str(discounted_price)
 
 
 # ---------------------------------------------
@@ -401,7 +426,8 @@ def main():
         name = row[NAME_COLUMN].strip()
         qty = int(row[QTY_COLUMN])
 
-        supplier_price = clean_price(row[PRICE_COLUMN])
+        supplier_recommended_price = clean_price(row[PRICE_COLUMN])
+        supplier_price = calculate_discounted_price(row[PRICE_COLUMN])
 
         variant = shopify_lookup.get(sku)
 
@@ -460,12 +486,16 @@ def main():
 
         elif current_shopify_price == supplier_price:
             unchanged_price_count += 1
-
-            price_message = f"price unchanged {supplier_price}"
-
+        
+            price_message = (
+                f"price unchanged {supplier_price} "
+                f"(10% below recommended {supplier_recommended_price})"
+            )
+        
             print(
                 f"✅ {name} ({sku}) → "
-                f"qty={qty}, price unchanged={supplier_price}"
+                f"qty={qty}, price unchanged={supplier_price} "
+                f"(recommended {supplier_recommended_price})"
             )
 
         else:
@@ -474,11 +504,15 @@ def main():
             if price_ok:
                 updated_price_count += 1
 
-                price_message = f"price {current_shopify_price} → {supplier_price}"
-
+                price_message = (
+                    f"price {current_shopify_price} → {supplier_price} "
+                    f"(10% below recommended {supplier_recommended_price})"
+                )
+                
                 print(
                     f"✅ {name} ({sku}) → "
-                    f"qty={qty}, price {current_shopify_price} → {supplier_price}"
+                    f"qty={qty}, price {current_shopify_price} → {supplier_price} "
+                    f"(recommended {supplier_recommended_price})"
                 )
 
             else:
