@@ -493,7 +493,6 @@ def page_body(items):
     latest, *archive = items
     dt = datetime.fromisoformat(latest["created_at"]).astimezone(TZ)
     parts = [
-        "<h1>Cjenici</h1>",
         "<p>Na ovoj stranici dostupni su javni dnevni cjenici internetske trgovine LuvMechanics u strojno čitljivom CSV formatu.</p>",
         "<h2>Najnoviji cjenik</h2>",
         f'<p><a href="{html.escape(latest["url"], quote=True)}">Preuzmi najnoviji CSV cjenik</a></p>',
