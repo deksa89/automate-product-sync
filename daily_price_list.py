@@ -29,20 +29,6 @@ TZ = ZoneInfo("Europe/Zagreb")
 GRAPHQL_URL = f"https://{STORE}/admin/api/{API_VERSION}/graphql.json"
 HEADERS = {"X-Shopify-Access-Token": TOKEN or "", "Content-Type": "application/json"}
 
-UNIT_PRICE_ML_BY_SKU = {
-    "D-224035": 240, "D-195073": 150, "D-230976": 100, "D-234934": 100,
-    "D-229363": 250, "D-201644": 100, "D-201646": 100, "D-210394": 120,
-    "D-230654": 100, "D-230670": 100, "D-230673": 100, "D-230676": 100,
-    "D-230685": 100, "D-236039": 100, "D-211758": 100, "D-244664": 100,
-}
-
-REVIEWED_NO_UNIT_PRICE_SKUS = {
-    "D11-201360", "D-194152", "D-196500", "D-201266", "D-201405",
-    "D-201836", "D-205290", "D-207281", "D-210392", "D-213109",
-    "D-213899", "D-221678", "D-224135", "D-229297", "D-230658",
-    "D-230660", "D-241200", "D-241697", "D-245255",
-}
-
 UNIT_PRICE_REVIEW_KEYWORDS = (
     "lubric", "lube", "massage oil", "massage gel", "moistur", "cream",
     "creme", "lotion", "body oil", "bodylube", "intimate gel",
@@ -62,6 +48,13 @@ query PriceListVariants($first: Int!, $after: String) {
     nodes {
       sku title barcode price compareAtPrice availableForSale
       anchorPrice: metafield(namespace: "custom", key: "anchor_price") { value }
+      unitPriceStatus: metafield(namespace: "custom", key: "unit_price_status") { value }
+      unitPriceMeasurement {
+        quantityValue
+        quantityUnit
+        referenceValue
+        referenceUnit
+      }
       product { title vendor productType status }
     }
     pageInfo { hasNextPage endCursor }
@@ -244,6 +237,24 @@ def validate_variants(variants):
         if anchor is None:
             problems.append(f"Missing custom.anchor_price: {sku}")
 
+        unit_status = ((v.get("unitPriceStatus") or {}).get("value") or "").strip()
+        if unit_status and unit_status not in {"required", "not_required"}:
+            problems.append(
+                f"Invalid custom.unit_price_status for {sku}: {unit_status}"
+            )
+
+        if unit_status == "required":
+            measurement = v.get("unitPriceMeasurement") or {}
+            if (
+                not measurement.get("quantityValue")
+                or not measurement.get("quantityUnit")
+                or not measurement.get("referenceValue")
+                or not measurement.get("referenceUnit")
+            ):
+                problems.append(
+                    f"Unit price is required but Shopify unitPriceMeasurement is incomplete: {sku}"
+                )
+
     if problems:
         raise RuntimeError("Price-list validation failed:\n- " + "\n- ".join(problems))
 
@@ -264,10 +275,10 @@ def unit_price_warnings(variants):
         product = v.get("product") or {}
         title = (product.get("title") or "").strip()
         product_type = (product.get("productType") or "").strip()
+        unit_status = ((v.get("unitPriceStatus") or {}).get("value") or "").strip()
 
-        if not sku or sku in UNIT_PRICE_ML_BY_SKU or sku in REVIEWED_NO_UNIT_PRICE_SKUS:
-            continue
-        if product_type.casefold() == "toy cleaner":
+        # Shopify is the source of truth for reviewed products.
+        if unit_status in {"required", "not_required"}:
             continue
 
         measurement = parse_measurement(title)
@@ -282,12 +293,60 @@ def unit_price_warnings(variants):
             continue
 
         if measurement:
-            reason = f"{measurement[0].normalize()} {measurement[1]}"
+            reason = (
+                f"unreviewed unit-price candidate: "
+                f"{measurement[0].normalize()} {measurement[1]}"
+            )
         else:
-            reason = "package size not found in title"
+            reason = "unreviewed unit-price candidate; package size not found in title"
 
         warnings.append({"sku": sku, "title": title, "reason": reason})
     return warnings
+
+
+def calculate_unit_price(price, measurement):
+    quantity_value = Decimal(str(measurement["quantityValue"]))
+    quantity_unit = measurement["quantityUnit"]
+    reference_value = Decimal(str(measurement["referenceValue"]))
+    reference_unit = measurement["referenceUnit"]
+
+    volume_to_l = {
+        "ML": Decimal("0.001"),
+        "CL": Decimal("0.01"),
+        "L": Decimal("1"),
+    }
+    mass_to_kg = {
+        "MG": Decimal("0.000001"),
+        "G": Decimal("0.001"),
+        "KG": Decimal("1"),
+    }
+
+    if quantity_unit in volume_to_l and reference_unit in volume_to_l:
+        package_base = quantity_value * volume_to_l[quantity_unit]
+        reference_base = reference_value * volume_to_l[reference_unit]
+    elif quantity_unit in mass_to_kg and reference_unit in mass_to_kg:
+        package_base = quantity_value * mass_to_kg[quantity_unit]
+        reference_base = reference_value * mass_to_kg[reference_unit]
+    else:
+        raise RuntimeError(
+            f"Unsupported unit-price conversion: {quantity_unit} -> {reference_unit}"
+        )
+
+    if package_base <= 0 or reference_base <= 0:
+        raise RuntimeError("Invalid zero/negative unit-price measurement.")
+
+    unit_price = (price * reference_base / package_base).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+
+    display_unit = {
+        "L": "l",
+        "KG": "kg",
+        "ML": "ml",
+        "G": "g",
+    }.get(reference_unit, reference_unit.lower())
+
+    return display_unit, f"{unit_price:.2f}"
 
 
 def display_name(v):
@@ -303,14 +362,13 @@ def build_rows(variants):
         price = money(v["price"])
         anchor = anchor_amount((v.get("anchorPrice") or {}).get("value"))
         sale = is_sale(v["price"], v.get("compareAtPrice"))
-        ml = UNIT_PRICE_ML_BY_SKU.get(sku)
+        unit_status = ((v.get("unitPriceStatus") or {}).get("value") or "").strip()
 
-        if ml:
-            unit = "l"
-            unit_price = (price / (Decimal(ml) / Decimal("1000"))).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
+        if unit_status == "required":
+            unit, unit_price_text = calculate_unit_price(
+                price,
+                v.get("unitPriceMeasurement") or {},
             )
-            unit_price_text = f"{unit_price:.2f}"
         else:
             unit, unit_price_text = "", ""
 
@@ -484,7 +542,10 @@ def main():
 
     sales = sum(is_sale(v["price"], v.get("compareAtPrice")) for v in variants)
     unavailable = sum(not v["availableForSale"] for v in variants)
-    unit_rows = sum(v["sku"] in UNIT_PRICE_ML_BY_SKU for v in variants)
+    unit_rows = sum(
+        ((v.get("unitPriceStatus") or {}).get("value") or "").strip() == "required"
+        for v in variants
+    )
 
     if DRY_RUN:
         filename = f"DRY-RUN_{now.strftime('%Y%m%d_%H%M')}.csv"
