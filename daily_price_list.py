@@ -489,32 +489,135 @@ def clean_archive(items, now):
     return cleaned
 
 
-def page_body(items):
+def page_body(items, locale="en"):
     latest, *archive = items
     dt = datetime.fromisoformat(latest["created_at"]).astimezone(TZ)
-    parts = [
-        "<p>Na ovoj stranici dostupni su javni dnevni cjenici internetske trgovine LuvMechanics u strojno čitljivom CSV formatu.</p>",
-        "<h2>Najnoviji cjenik</h2>",
-        f'<p><a href="{html.escape(latest["url"], quote=True)}">Preuzmi najnoviji CSV cjenik</a></p>',
-        f'<p>Objavljeno: {dt.strftime("%d.%m.%Y. %H:%M")} &middot; Broj stavki: {latest["rows"]}</p>',
-        "<h2>Arhiva cjenika</h2>",
-    ]
+
+    if locale == "hr":
+        parts = [
+            "<p>Na ovoj stranici dostupni su javni dnevni cjenici internetske trgovine LuvMechanics u strojno čitljivom CSV formatu.</p>",
+            "<h2>Najnoviji cjenik</h2>",
+            f'<p><a href="{html.escape(latest["url"], quote=True)}">Preuzmi najnoviji CSV cjenik</a></p>',
+            f'<p>Objavljeno: {dt.strftime("%d.%m.%Y. %H:%M")} &middot; Broj stavki: {latest["rows"]}</p>',
+            "<h2>Arhiva cjenika</h2>",
+        ]
+    else:
+        parts = [
+            "<p>Public daily price lists for the LuvMechanics online store are available on this page in machine-readable CSV format.</p>",
+            "<h2>Latest price list</h2>",
+            f'<p><a href="{html.escape(latest["url"], quote=True)}">Download the latest CSV price list</a></p>',
+            f'<p>Published: {dt.strftime("%d.%m.%Y. %H:%M")} &middot; Number of items: {latest["rows"]}</p>',
+            "<h2>Price list archive</h2>",
+        ]
+
     if archive:
         parts.append("<ul>")
         for item in archive:
             item_dt = datetime.fromisoformat(item["created_at"]).astimezone(TZ)
-            label = f'{item_dt.strftime("%d.%m.%Y. %H:%M")} ({item["rows"]} stavki)'
-            parts.append(f'<li><a href="{html.escape(item["url"], quote=True)}">{html.escape(label)}</a></li>')
+            if locale == "hr":
+                label = f'{item_dt.strftime("%d.%m.%Y. %H:%M")} ({item["rows"]} stavki)'
+            else:
+                label = f'{item_dt.strftime("%d.%m.%Y. %H:%M")} ({item["rows"]} items)'
+            parts.append(
+                f'<li><a href="{html.escape(item["url"], quote=True)}">'
+                f'{html.escape(label)}</a></li>'
+            )
         parts.append("</ul>")
     else:
-        parts.append("<p>Prethodni cjenici još nisu dostupni.</p>")
+        if locale == "hr":
+            parts.append("<p>Prethodni cjenici još nisu dostupni.</p>")
+        else:
+            parts.append("<p>No previous price lists are available yet.</p>")
+
     return "\n".join(parts)
+
+
+TRANSLATABLE_PAGE_QUERY = """
+query PriceListTranslations($resourceId: ID!) {
+  translatableResource(resourceId: $resourceId) {
+    translatableContent {
+      key
+      digest
+    }
+  }
+}
+"""
+
+TRANSLATIONS_REGISTER_MUTATION = """
+mutation RegisterPriceListTranslations(
+  $resourceId: ID!,
+  $translations: [TranslationInput!]!
+) {
+  translationsRegister(
+    resourceId: $resourceId,
+    translations: $translations
+  ) {
+    translations {
+      key
+      locale
+      value
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+
+def update_croatian_translation(page_id, items):
+    data = gql(TRANSLATABLE_PAGE_QUERY, {"resourceId": page_id})
+    resource = data.get("translatableResource")
+    if not resource:
+        raise RuntimeError("Cjenici page is not available for translation.")
+
+    digests = {
+        item["key"]: item["digest"]
+        for item in resource.get("translatableContent", [])
+    }
+
+    required = {"title", "body_html"}
+    missing = required - set(digests)
+    if missing:
+        raise RuntimeError(
+            f"Missing Cjenici translation digest(s): {sorted(missing)}"
+        )
+
+    data = gql(
+        TRANSLATIONS_REGISTER_MUTATION,
+        {
+            "resourceId": page_id,
+            "translations": [
+                {
+                    "locale": "hr",
+                    "key": "title",
+                    "value": "Cjenici",
+                    "translatableContentDigest": digests["title"],
+                },
+                {
+                    "locale": "hr",
+                    "key": "body_html",
+                    "value": page_body(items, locale="hr"),
+                    "translatableContentDigest": digests["body_html"],
+                },
+            ],
+        },
+    )
+
+    result = data["translationsRegister"]
+    if result["userErrors"]:
+        raise RuntimeError(
+            "Croatian page translation failed: "
+            + str(result["userErrors"])
+        )
 
 
 def update_page(page_id, items, sequence):
     manifest = {"sequence": sequence, "items": items}
     data = gql(PAGE_UPDATE_MUTATION, {"id": page_id, "page": {
-        "body": page_body(items),
+        "title": "Price Lists",
+        "body": page_body(items, locale="en"),
         "isPublished": True,
         "metafields": [{
             "namespace": "custom",
@@ -528,6 +631,8 @@ def update_page(page_id, items, sequence):
         raise RuntimeError(str(result["userErrors"]))
     if not result["page"]["isPublished"]:
         raise RuntimeError("Cjenici page is still unpublished.")
+
+    update_croatian_translation(page_id, items)
 
 
 def main():
