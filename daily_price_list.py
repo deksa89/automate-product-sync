@@ -1,4 +1,4 @@
-import csv
+# Dry-run validation branch; no functional change.\nimport csv
 import html
 import json
 import os
