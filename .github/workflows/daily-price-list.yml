@@ -1,0 +1,83 @@
+name: LuvMechanics Daily Price List
+
+on:
+  # GitHub Actions cron is UTC.
+  # 04:30 UTC = 05:30 in Croatian winter time / 06:30 in summer time.
+  schedule:
+    - cron: "30 4 * * 1-5"
+
+  # PR validation is always a safe dry-run.
+  pull_request:
+    paths:
+      - "daily_price_list.py"
+      - ".github/workflows/daily-price-list.yml"
+      - "requirements.txt"
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Generate and validate CSV only; do not upload/publish"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  publish-price-list:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    concurrency:
+      group: shopify-daily-price-list
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate and publish daily price list
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_API_VERSION: "2026-07"
+
+          PRICE_LIST_PAGE_HANDLE: "cjenici"
+          PRICE_LIST_STORE_CODE: "WEB-01"
+          PRICE_LIST_ADDRESS_SLUG: "ulica-sv-mateja-127_10000-zagreb"
+          PRICE_LIST_ARCHIVE_DAYS: "35"
+
+          # PR = always dry-run.
+          # Manual run = uses the selected dry_run input.
+          # Scheduled run = publishes.
+          PRICE_LIST_DRY_RUN: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
+        run: |
+          python daily_price_list.py
+
+      - name: Upload generated CSV as GitHub Actions artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-price-list-${{ github.run_id }}
+          path: price_lists/*.csv
+          if-no-files-found: ignore
+          retention-days: 7
