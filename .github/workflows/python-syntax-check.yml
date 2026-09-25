@@ -1,0 +1,27 @@
+name: Python Syntax Check
+
+on:
+  pull_request:
+    paths:
+      - "final_sync.py"
+      - "daily_price_list.py"
+      - ".github/workflows/python-syntax-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python files
+        run: |
+          python -m py_compile final_sync.py daily_price_list.py
