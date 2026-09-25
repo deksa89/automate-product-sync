@@ -1,10 +1,15 @@
 name: LuvMechanics Daily Price List
 
 on:
-  # GitHub Actions cron is UTC.
-  # 04:30 UTC = 05:30 in Croatian winter time / 06:30 in summer time.
+  # GitHub Actions cron is UTC. Multiple attempts improve reliability.
+  # Croatia: 05:15/06:15, 05:45/06:45, 06:15/07:15, 06:45/07:45.
+  # The Python script exits without creating a duplicate if today's file
+  # has already been published.
   schedule:
-    - cron: "30 4 * * 1-5"
+    - cron: "15 4 * * 1-5"
+    - cron: "45 4 * * 1-5"
+    - cron: "15 5 * * 1-5"
+    - cron: "45 5 * * 1-5"
 
   # PR validation is always a safe dry-run.
   pull_request:
