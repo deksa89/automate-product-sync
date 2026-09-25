@@ -580,6 +580,30 @@ mutation RegisterPriceListTranslations(
 """
 
 
+def verify_translation_access(page_id):
+    """
+    Fail before any upload/page mutation if the app cannot read translation
+    digests. This prevents partially published daily price lists.
+    """
+    data = gql(TRANSLATABLE_PAGE_QUERY, {"resourceId": page_id})
+    resource = data.get("translatableResource")
+    if not resource:
+        raise RuntimeError(
+            "Translation preflight failed: Cjenici page is not available "
+            "through the translation API."
+        )
+
+    digests = {
+        item["key"]: item["digest"]
+        for item in resource.get("translatableContent", [])
+    }
+    missing = {"title", "body_html"} - set(digests)
+    if missing:
+        raise RuntimeError(
+            f"Translation preflight failed; missing digest(s): {sorted(missing)}"
+        )
+
+
 def update_croatian_translation(page_id, items):
     data = gql(TRANSLATABLE_PAGE_QUERY, {"resourceId": page_id})
     resource = data.get("translatableResource")
@@ -661,6 +685,7 @@ def main():
     # or creating another Shopify file.
     if not DRY_RUN:
         page, manifest = get_page_and_manifest()
+        verify_translation_access(page["id"])
         existing = already_published_today(manifest, now)
         if existing:
             message = (
