@@ -1,10 +1,13 @@
 import os
 import io
+import json
 import re
 import time
 import requests
 import pandas as pd
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,6 +20,14 @@ TOKEN = os.getenv("SHOPIFY_TOKEN")
 CSV_URL = os.getenv("SUPPLIER_FEED")
 
 API_VERSION = "2024-10"
+GRAPHQL_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
+GRAPHQL_URL = f"https://{STORE}/admin/api/{GRAPHQL_API_VERSION}/graphql.json"
+
+ANCHOR_REFERENCE_DATE = date.fromisoformat(
+    os.getenv("ANCHOR_REFERENCE_DATE", "2026-09-10")
+)
+ANCHOR_CURRENCY = os.getenv("ANCHOR_CURRENCY", "EUR")
+LOCAL_TZ = ZoneInfo("Europe/Zagreb")
 
 SKU_COLUMN = "sku"
 QTY_COLUMN = "available_stock"
@@ -221,6 +232,283 @@ def shopify_request(method, url, **kwargs):
 
 
 # ---------------------------------------------
+# GRAPHQL HELPERS FOR NEW-PRODUCT ANCHOR PRICES
+# ---------------------------------------------
+ANCHOR_VARIANTS_QUERY = """
+query AnchorVariants($first: Int!, $after: String) {
+  productVariants(first: $first, after: $after) {
+    nodes {
+      id
+      legacyResourceId
+      sku
+      createdAt
+      price
+      compareAtPrice
+      anchorPrice: metafield(namespace: "custom", key: "anchor_price") { value }
+      anchorDate: metafield(namespace: "custom", key: "anchor_date") { value }
+      anchorSource: metafield(namespace: "custom", key: "anchor_source") { value }
+      product {
+        id
+        title
+        status
+        publishedAt
+        onlineStoreUrl
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+SET_ANCHOR_METAFIELDS_MUTATION = """
+mutation SetAnchorMetafields($metafields: [MetafieldsSetInput!]!) {
+  metafieldsSet(metafields: $metafields) {
+    metafields { id namespace key value type }
+    userErrors { field message code }
+  }
+}
+"""
+
+
+def graphql_request(query, variables=None):
+    payload = {"query": query, "variables": variables or {}}
+
+    for attempt in range(6):
+        response = requests.post(
+            GRAPHQL_URL,
+            headers=HEADERS,
+            json=payload,
+            timeout=60,
+        )
+
+        if response.status_code == 429 or response.status_code >= 500:
+            wait_seconds = min(2 ** attempt, 20)
+            print(f"⏳ Shopify GraphQL retry in {wait_seconds}s...")
+            time.sleep(wait_seconds)
+            continue
+
+        response.raise_for_status()
+        data = response.json()
+
+        errors = data.get("errors") or []
+        if errors:
+            throttled = all(
+                error.get("extensions", {}).get("code") == "THROTTLED"
+                for error in errors
+            )
+            if throttled:
+                wait_seconds = min(2 ** attempt, 20)
+                time.sleep(wait_seconds)
+                continue
+            raise RuntimeError(
+                "Shopify GraphQL error: "
+                + json.dumps(errors, ensure_ascii=False)
+            )
+
+        return data.get("data") or {}
+
+    raise RuntimeError("Shopify GraphQL failed after retries.")
+
+
+def get_anchor_variant_contexts():
+    contexts = []
+    after = None
+
+    while True:
+        data = graphql_request(
+            ANCHOR_VARIANTS_QUERY,
+            {"first": 250, "after": after},
+        )
+        connection = data["productVariants"]
+        contexts.extend(connection["nodes"])
+
+        if not connection["pageInfo"]["hasNextPage"]:
+            break
+
+        after = connection["pageInfo"]["endCursor"]
+
+    return contexts
+
+
+def parse_shopify_datetime(value):
+    if not value:
+        return None
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def first_offer_datetime(variant):
+    """
+    Best available Shopify timestamp for first online-store offering:
+    - product publishedAt for a newly published product;
+    - variant createdAt when a new variant is added to an already published product.
+
+    Using the later timestamp covers both cases.
+    """
+    product = variant.get("product") or {}
+    published_at = parse_shopify_datetime(product.get("publishedAt"))
+    variant_created_at = parse_shopify_datetime(variant.get("createdAt"))
+
+    timestamps = [
+        value for value in (published_at, variant_created_at)
+        if value is not None
+    ]
+    return max(timestamps) if timestamps else None
+
+
+def set_anchor_metafields(variant_gid, price, anchor_date):
+    source = (
+        f"First online-store listing {anchor_date.isoformat()} "
+        f"after {ANCHOR_REFERENCE_DATE.isoformat()} - auto"
+    )
+
+    metafields = [
+        {
+            "ownerId": variant_gid,
+            "namespace": "custom",
+            "key": "anchor_price",
+            "type": "money",
+            "value": json.dumps(
+                {
+                    "amount": price,
+                    "currency_code": ANCHOR_CURRENCY,
+                },
+                separators=(",", ":"),
+            ),
+        },
+        {
+            "ownerId": variant_gid,
+            "namespace": "custom",
+            "key": "anchor_date",
+            "type": "date",
+            "value": anchor_date.isoformat(),
+        },
+        {
+            "ownerId": variant_gid,
+            "namespace": "custom",
+            "key": "anchor_source",
+            "type": "single_line_text_field",
+            "value": source,
+        },
+    ]
+
+    data = graphql_request(
+        SET_ANCHOR_METAFIELDS_MUTATION,
+        {"metafields": metafields},
+    )
+    result = data["metafieldsSet"]
+
+    if result["userErrors"]:
+        raise RuntimeError(
+            "Anchor metafield update failed: "
+            + json.dumps(result["userErrors"], ensure_ascii=False)
+        )
+
+
+def process_new_product_anchors():
+    """
+    Create anchor data only for genuinely new online-store offers after
+    the fixed reference date.
+
+    Existing anchor_price/anchor_date values are never modified.
+
+    Ambiguous cases are left untouched and reported for manual review:
+    - only one of anchor_price / anchor_date exists;
+    - an older product is missing anchor data;
+    - the first observed price is already a sale price;
+    - first-offer timestamp or current price is unavailable.
+    """
+    created = []
+    review = []
+    failed = []
+
+    contexts = get_anchor_variant_contexts()
+
+    for variant in contexts:
+        product = variant.get("product") or {}
+        sku = (variant.get("sku") or "").strip() or "(no SKU)"
+        title = (product.get("title") or "").strip() or "Unknown product"
+
+        # Only products currently offered through the Online Store.
+        if product.get("status") != "ACTIVE":
+            continue
+        if not product.get("onlineStoreUrl"):
+            continue
+
+        anchor_price = ((variant.get("anchorPrice") or {}).get("value") or "").strip()
+        anchor_date = ((variant.get("anchorDate") or {}).get("value") or "").strip()
+
+        # Never change a complete existing anchor record.
+        if anchor_price and anchor_date:
+            continue
+
+        if anchor_price or anchor_date:
+            review.append(
+                f"{sku} | {title} | incomplete anchor data; "
+                "existing metafield(s) left unchanged"
+            )
+            continue
+
+        first_offer_at = first_offer_datetime(variant)
+        if first_offer_at is None:
+            review.append(
+                f"{sku} | {title} | no reliable first-offer timestamp"
+            )
+            continue
+
+        first_offer_date = first_offer_at.astimezone(LOCAL_TZ).date()
+
+        # Products/variants already offered on or before the reference date
+        # must not be backfilled from today's price.
+        if first_offer_date <= ANCHOR_REFERENCE_DATE:
+            review.append(
+                f"{sku} | {title} | missing anchor for offer dated "
+                f"{first_offer_date.isoformat()}; manual historical check required"
+            )
+            continue
+
+        current_price = clean_price(variant.get("price"))
+        compare_at_price = clean_price(variant.get("compareAtPrice"))
+
+        if current_price is None:
+            review.append(
+                f"{sku} | {title} | current Shopify price is invalid"
+            )
+            continue
+
+        # Do not guess the regular first-listing price if the product is already
+        # presented as a special/sale price at first detection.
+        if is_variant_on_sale(current_price, compare_at_price):
+            review.append(
+                f"{sku} | {title} | first detected after reference date but "
+                f"already on sale ({current_price} / compare-at {compare_at_price}); "
+                "anchor not written"
+            )
+            continue
+
+        try:
+            set_anchor_metafields(
+                variant["id"],
+                current_price,
+                first_offer_date,
+            )
+            created.append(
+                f"{sku} | {title} | {current_price} EUR | "
+                f"{first_offer_date.isoformat()}"
+            )
+            print(
+                f"⚓ Anchor created for {sku}: "
+                f"{current_price} EUR on {first_offer_date.isoformat()}"
+            )
+        except Exception as exc:
+            failed.append(
+                f"{sku} | {title} | {exc}"
+            )
+            print(f"⚠️ Anchor creation failed for {sku}: {exc}")
+
+    return created, review, failed
+
+
+# ---------------------------------------------
 # LOAD SHOPIFY VARIANTS
 # ---------------------------------------------
 def get_all_shopify_variants():
@@ -395,6 +683,20 @@ def load_csv_data(csv_url: str):
 def main():
     validate_env()
 
+    anchor_created = []
+    anchor_review = []
+    anchor_failed = []
+
+    # Capture first-listing anchor data before this sync can change prices.
+    # Anchor failures do not block stock/price synchronization; they are
+    # reported prominently and the daily price-list validation remains a
+    # second compliance guard.
+    try:
+        anchor_created, anchor_review, anchor_failed = process_new_product_anchors()
+    except Exception as exc:
+        anchor_failed.append(f"Anchor pre-check failed: {exc}")
+        print(f"⚠️ Anchor pre-check failed: {exc}")
+
     df = load_csv_data(CSV_URL)
     shopify_variants = get_all_shopify_variants()
     location_id = get_first_location_id()
@@ -541,6 +843,23 @@ def main():
     print(f"Skipped sale prices: {skipped_sale_price_count}")
     print(f"Skipped invalid prices: {skipped_invalid_price_count}")
     print(f"Failed price updates: {failed_price_count}")
+    print(f"New anchors created: {len(anchor_created)}")
+    print(f"Anchors requiring review: {len(anchor_review)}")
+    print(f"Anchor failures: {len(anchor_failed)}")
+
+    anchor_section = (
+        "\n\nANCHOR PRICE AUTOMATION\n"
+        f"New anchors created: {len(anchor_created)}\n"
+        f"Requires manual review: {len(anchor_review)}\n"
+        f"Anchor failures: {len(anchor_failed)}\n"
+    )
+
+    if anchor_created:
+        anchor_section += "\nCreated:\n" + "\n".join(anchor_created[:100]) + "\n"
+    if anchor_review:
+        anchor_section += "\nManual review required:\n" + "\n".join(anchor_review[:100]) + "\n"
+    if anchor_failed:
+        anchor_section += "\nFailures:\n" + "\n".join(anchor_failed[:100]) + "\n"
 
     body = (
         "Shopify–Dreamlove stock and price sync finished.\n\n"
@@ -551,14 +870,21 @@ def main():
         f"Unchanged prices: {unchanged_price_count}\n"
         f"Skipped sale prices: {skipped_sale_price_count}\n"
         f"Skipped invalid prices: {skipped_invalid_price_count}\n"
-        f"Failed price updates: {failed_price_count}\n\n"
+        f"Failed price updates: {failed_price_count}\n"
+        + anchor_section
+        + "\nSYNC DETAILS\n"
         + "\n".join(updated_items[:500])
     )
 
     if len(updated_items) > 500:
         body += f"\n\n...and {len(updated_items) - 500} more items."
 
-    send_mail("Shopify Stock & Price Sync Completed", body)
+    subject = (
+        "Shopify Stock & Price Sync Completed - ANCHOR REVIEW NEEDED"
+        if anchor_review or anchor_failed
+        else "Shopify Stock & Price Sync Completed"
+    )
+    send_mail(subject, body)
 
 
 if __name__ == "__main__":
