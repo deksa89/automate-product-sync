@@ -422,6 +422,20 @@ def get_page_and_manifest():
     return page, {"sequence": int(manifest.get("sequence", 0)), "items": manifest.get("items", [])}
 
 
+def already_published_today(manifest, now):
+    today = now.astimezone(TZ).date()
+    for item in manifest.get("items", []):
+        try:
+            created = datetime.fromisoformat(item["created_at"])
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=TZ)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if created.astimezone(TZ).date() == today:
+            return item
+    return None
+
+
 def stage_file(filename):
     data = gql(STAGE_MUTATION, {"input": [{
         "resource": "FILE", "filename": filename, "mimeType": "text/csv", "httpMethod": "POST"
@@ -639,6 +653,29 @@ def main():
     validate_env()
     now = datetime.now(TZ)
 
+    page = None
+    manifest = None
+
+    # Production runs may be scheduled several times for reliability.
+    # If today's price list already exists, exit before fetching product data
+    # or creating another Shopify file.
+    if not DRY_RUN:
+        page, manifest = get_page_and_manifest()
+        existing = already_published_today(manifest, now)
+        if existing:
+            message = (
+                f"SKIPPED: a price list for {now.strftime('%Y-%m-%d')} "
+                f"already exists: {existing.get('filename', 'unknown file')}"
+            )
+            print(message)
+            append_summary([
+                "## LuvMechanics daily price list — already published",
+                f"- Date: **{now.strftime('%Y-%m-%d')}**",
+                f"- Existing file: `{existing.get('filename', 'unknown')}`",
+                "- No new CSV was generated.",
+            ])
+            return
+
     variants = get_active_variants()
     validate_variants(variants)
     warnings = unit_price_warnings(variants)
@@ -670,7 +707,6 @@ def main():
         print(f"DRY RUN OK: {len(rows)} rows; warnings={len(warnings)}")
         return
 
-    page, manifest = get_page_and_manifest()
     sequence = manifest["sequence"] + 1
     filename = (
         f"internetska-trgovina_{ADDRESS_SLUG}_{STORE_CODE}_"
